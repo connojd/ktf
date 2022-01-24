@@ -36,6 +36,157 @@ static inline bool pci_dev_is_multifunc(pcidev_t *dev) {
     return ((dev->hdr & PCI_HDR_MULTIFUNC) != 0);
 }
 
+static inline void pci_disable_io(uint8_t bus, uint8_t dev, uint8_t func) {
+    uint32_t cfg_val = pci_cfg_read(bus, dev, func, PCI_REG_COMMAND);
+
+    cfg_val &= ~(PCI_COMMAND_PIO | PCI_COMMAND_MMIO);
+    pci_cfg_write(bus, dev, func, PCI_REG_COMMAND, cfg_val);
+}
+
+static inline void pci_enable_io(uint8_t bus, uint8_t dev, uint8_t func) {
+    uint32_t cfg_val = pci_cfg_read(bus, dev, func, PCI_REG_COMMAND);
+
+    cfg_val |= (PCI_COMMAND_PIO | PCI_COMMAND_MMIO);
+    pci_cfg_write(bus, dev, func, PCI_REG_COMMAND, cfg_val);
+}
+
+/* Debug helper */
+__attribute__((unused)) static void dump_pci_cfg(uint8_t bus, uint8_t dev, uint8_t func) {
+    printk("pci: config space for %02x:%02x.%1x\n", bus, dev, func);
+
+    const unsigned nr_lines = 16;
+    const unsigned nr_regs = 4;
+
+    for (unsigned line = 0; line < nr_lines; line++) {
+        for (unsigned i = 0; i < nr_regs; i++) {
+            const uint32_t reg = line * 4 + i;
+            const uint32_t cfg_val = pci_cfg_read(bus, dev, func, reg);
+
+            printk(" %02x%02x%02x%02x", (cfg_val & 0xFF), (cfg_val & 0xFF00) >> 8,
+                   (cfg_val & 0xFF0000) >> 16, (cfg_val & 0xFF000000) >> 24);
+        }
+
+        printk("\n");
+    }
+}
+
+static uint64_t size_pio_bar(uint8_t bus, uint8_t dev, uint8_t func, uint8_t reg) {
+    uint32_t cfg_val, orig_val;
+    uint64_t size;
+
+    /* Save original value and write 1's to BAR */
+    orig_val = pci_cfg_read(bus, dev, func, reg);
+    pci_cfg_write(bus, dev, func, reg, ~0U);
+
+    /* Read encoded size, mask off rsvd/type bits */
+    cfg_val = pci_cfg_read(bus, dev, func, reg);
+    cfg_val &= PCI_BAR_PIO_BASE_MASK;
+
+    /* Calculate size */
+    size = ~cfg_val + 1;
+
+    /* Restore original BAR value and enable PIO/MMIO */
+    pci_cfg_write(bus, dev, func, reg, orig_val);
+
+    return size;
+}
+
+static uint64_t size_32bit_mmio_bar(uint8_t bus, uint8_t dev, uint8_t func, uint8_t reg) {
+    uint32_t cfg_val, orig_val;
+    uint64_t size;
+
+    /* Save original value and write 1's to BAR */
+    orig_val = pci_cfg_read(bus, dev, func, reg);
+    pci_cfg_write(bus, dev, func, reg, ~0U);
+
+    /* Read encoded size, mask off rsvd/type bits */
+    cfg_val = pci_cfg_read(bus, dev, func, reg);
+    cfg_val &= PCI_BAR_MMIO_BASE_MASK;
+
+    /* Calculate size */
+    size = ~cfg_val + 1;
+
+    /* Restore original BAR value and enable PIO/MMIO */
+    pci_cfg_write(bus, dev, func, reg, orig_val);
+
+    return size;
+}
+
+static uint64_t size_64bit_mmio_bar(uint8_t bus, uint8_t dev, uint8_t func, uint8_t reg) {
+    uint32_t cfg_val_lo, cfg_val_hi, orig_val_lo, orig_val_hi;
+    uint64_t size;
+
+    /* Save original value and write 1's to BAR */
+    orig_val_lo = pci_cfg_read(bus, dev, func, reg);
+    orig_val_hi = pci_cfg_read(bus, dev, func, reg + 1);
+
+    pci_cfg_write(bus, dev, func, reg, ~0U);
+    pci_cfg_write(bus, dev, func, reg + 1, ~0U);
+
+    /* Read encoded size, mask off rsvd/type bits */
+    cfg_val_lo = pci_cfg_read(bus, dev, func, reg);
+    cfg_val_hi = pci_cfg_read(bus, dev, func, reg + 1);
+    cfg_val_lo &= PCI_BAR_MMIO_BASE_MASK;
+
+    /* Calculate size */
+    size = ~(((uint64_t) cfg_val_hi << 32) | cfg_val_lo) + 1;
+
+    /* Restore original BAR value and enable PIO/MMIO */
+    pci_cfg_write(bus, dev, func, reg, orig_val_lo);
+    pci_cfg_write(bus, dev, func, reg + 1, orig_val_hi);
+
+    return size;
+}
+
+static void pci_dev_parse_bars(pcidev_t *dev) {
+    const uint32_t first_bar = 4;
+    const uint32_t last_bar = ((dev->hdr & PCI_HDR_TYPE) == PCI_HDR_TYPE_NORMAL) ? 9 : 5;
+
+    list_init(&dev->bar_list);
+
+    /* Disable PIO/MMIO for subsequent BAR sizing */
+    pci_disable_io(dev->bus, dev->dev, dev->func);
+
+    for (uint32_t i = first_bar; i <= last_bar; i++) {
+        pcibar_t *bar;
+        uint32_t cfg_val = pci_cfg_read(dev->bus, dev->dev, dev->func, i);
+
+        if (0 == cfg_val)
+            continue;
+
+        bar = kzalloc(sizeof(*bar));
+        BUG_ON(!bar);
+
+        if ((cfg_val & PCI_BAR_TYPE_MASK) == PCI_BAR_TYPE_PIO) {
+            bar->type = PCI_BAR_TYPE_PIO;
+            bar->base = cfg_val & PCI_BAR_PIO_BASE_MASK;
+            bar->size = size_pio_bar(dev->bus, dev->dev, dev->func, i);
+        }
+        else {
+            bar->type = PCI_BAR_TYPE_MMIO;
+            bar->base = cfg_val & PCI_BAR_MMIO_BASE_MASK;
+
+            if ((cfg_val & PCI_BAR_MMIO_BIT_MASK) == PCI_BAR_MMIO_64BIT) {
+                cfg_val = pci_cfg_read(dev->bus, dev->dev, dev->func, i + 1);
+
+                bar->base |= ((uint64_t) cfg_val << 32);
+                bar->size = size_64bit_mmio_bar(dev->bus, dev->dev, dev->func, i);
+                i++;
+            }
+            else {
+                bar->size = size_32bit_mmio_bar(dev->bus, dev->dev, dev->func, i);
+            }
+
+            bar->prefetch = !!(cfg_val & PCI_BAR_MMIO_PREFETCH);
+        }
+
+        list_add_tail(&bar->list, &dev->bar_list);
+        dev->nr_bars++;
+    }
+
+    pci_enable_io(dev->bus, dev->dev, dev->func);
+}
+
 static pcidev_t *probe_pci_dev(uint8_t bus, uint8_t dev, uint8_t func,
                                uint32_t device_vendor) {
     uint32_t cfg_val;
@@ -65,6 +216,8 @@ static pcidev_t *probe_pci_dev(uint8_t bus, uint8_t dev, uint8_t func,
 
     if (new_dev->status & PCI_STATUS_CAP_LIST)
         new_dev->cap_ptr = pci_cfg_read8(bus, dev, func, PCI_REG_CAP_PTR);
+
+    pci_dev_parse_bars(new_dev);
 
     return new_dev;
 }
@@ -144,11 +297,21 @@ static void probe_pci(void) {
     host_bridge->subclass = PCI_SUBCLASS_HOST_BRIDGE;
     host_bridge->bridge = NULL;
 
-    strncpy(&host_bridge->bdf_str[0], "00:0.0", sizeof(host_bridge->bdf_str));
+    strncpy(&host_bridge->bdf_str[0], "00:00.0", sizeof(host_bridge->bdf_str));
     list_add_tail(&host_bridge->list, &pci_list);
 
     /* Probe the rest of bus 0 */
     probe_pci_bus(0, 1, host_bridge);
+}
+
+static void pci_dev_print_bars(pcidev_t *dev) {
+    pcibar_t *bar;
+
+    list_for_each_entry (bar, &dev->bar_list, list) {
+        printk("pci: %s: %s BAR @ [0x%016x - 0x%016x] %s\n", &dev->bdf_str[0],
+               bar->type == PCI_BAR_TYPE_PIO ? "PIO " : "MMIO", bar->base,
+               bar->base + bar->size - 1, bar->prefetch ? "prefetch" : "");
+    }
 }
 
 void init_pci(void) {
@@ -159,5 +322,8 @@ void init_pci(void) {
 
     list_for_each_entry (dev, &pci_list, list) {
         printk("pci: found device at %s\n", &dev->bdf_str[0]);
+
+        if (dev->nr_bars > 0)
+            pci_dev_print_bars(dev);
     }
 }

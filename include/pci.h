@@ -38,6 +38,8 @@
 #define PCI_DEVICE_SHIFT 16
 
 #define PCI_COMMAND_MASK 0x0000FFFF
+#define PCI_COMMAND_PIO  (1U << 0)
+#define PCI_COMMAND_MMIO (1U << 1)
 
 #define PCI_STATUS_MASK     0xFFFF0000
 #define PCI_STATUS_SHIFT    16
@@ -82,8 +84,22 @@
 
 #define PCI_DEV_EXISTS(cfg_reg0) (PCI_VENDOR(cfg_reg0) != PCI_VENDOR_INVALID)
 
+#define PCI_BAR_TYPE_MASK 0x1
+#define PCI_BAR_TYPE_MMIO 0x0
+#define PCI_BAR_TYPE_PIO  0x1
+
+#define PCI_BAR_MMIO_BIT_MASK 0x6
+#define PCI_BAR_MMIO_32BIT    0x0
+#define PCI_BAR_MMIO_64BIT    0x4
+#define PCI_BAR_MMIO_PREFETCH 0x8
+
+#define PCI_BAR_PIO_BASE_MASK  0xFFFFFFFC
+#define PCI_BAR_MMIO_BASE_MASK 0xFFFFFFF0
+
 struct pcidev {
     list_head_t list;
+    list_head_t bar_list;
+    uint8_t nr_bars;
     uint32_t segment : 16;
     uint32_t bus : 8;
     uint32_t dev : 5;
@@ -100,6 +116,15 @@ struct pcidev {
     char bdf_str[8];
 };
 typedef struct pcidev pcidev_t;
+
+struct pcibar {
+    list_head_t list;
+    uint64_t base;
+    uint64_t size;
+    uint8_t type;
+    bool prefetch;
+};
+typedef struct pcibar pcibar_t;
 
 extern void init_pci(void);
 
